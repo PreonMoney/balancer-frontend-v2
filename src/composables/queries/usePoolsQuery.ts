@@ -7,17 +7,20 @@ import { Pool } from '@/services/pool/types';
 import useNetwork from '../useNetwork';
 import { useTokens } from '@/providers/tokens.provider';
 import { configService } from '@/services/config/config.service';
-import { GraphQLArgs, PoolsRepositoryFetchOptions } from '@balancer-labs/sdk';
-import { getPoolsFallbackRepository } from '@/dependencies/PoolsFallbackRepository';
-import { PoolDecorator } from '@/services/pool/decorators/pool.decorator';
+import { PoolsRepositoryFetchOptions } from '@balancer-labs/sdk';
 import { flatten } from 'lodash';
 import { tokenTreeLeafs } from '../usePoolHelpers';
-import { balancerSubgraphService } from '@/services/balancer/subgraph/balancer-subgraph.service';
 import { balancerAPIService } from '@/services/balancer/api/balancer-api.service';
 import { poolsStoreService } from '@/services/pool/pools-store.service';
 import { isBalancerApiDefined } from '@/lib/utils/balancer/api';
 import { bnum } from '@/lib/utils';
 import { PoolFilterOptions } from '@/types/pools';
+import {
+  GqlPoolOrderBy,
+  GqlPoolOrderDirection,
+} from '@/services/api/graphql/generated/api-types';
+import { ApiArgs } from '@/services/balancer/api/entities/pools';
+import { mapNetworkToApiChain, mapPoolTypeToApiType } from '@/lib/utils/api';
 
 type PoolsQueryResponse = {
   pools: Pool[];
@@ -28,7 +31,7 @@ export default function usePoolsQuery(filterOptions: PoolFilterOptions) {
   /**
    * COMPOSABLES
    */
-  const { injectTokens, tokens: tokenMeta } = useTokens();
+  const { injectTokens } = useTokens();
   const { networkId } = useNetwork();
   let poolsRepository = initializePoolsRepository();
 
@@ -37,14 +40,6 @@ export default function usePoolsQuery(filterOptions: PoolFilterOptions) {
    */
 
   function initializePoolsRepository() {
-    const FallbackRepository = getPoolsFallbackRepository();
-    const fallbackRepository = new FallbackRepository(buildRepositories(), {
-      timeout: 30 * 1000,
-    });
-    return fallbackRepository;
-  }
-
-  function initializeDecoratedAPIRepository() {
     return {
       fetch: async (options: PoolsRepositoryFetchOptions): Promise<Pool[]> => {
         const pools = await balancerAPIService.pools.get(getQueryArgs(options));
@@ -63,80 +58,47 @@ export default function usePoolsQuery(filterOptions: PoolFilterOptions) {
     };
   }
 
-  function initializeDecoratedSubgraphRepository() {
-    return {
-      fetch: async (options: PoolsRepositoryFetchOptions): Promise<Pool[]> => {
-        const pools = await balancerSubgraphService.pools.get(
-          getQueryArgs(options)
-        );
-
-        const poolDecorator = new PoolDecorator(pools);
-        let decoratedPools = await poolDecorator.decorate(tokenMeta.value);
-
-        const tokens = flatten(
-          pools.map(pool => [
-            ...pool.tokensList,
-            ...tokenTreeLeafs(pool.tokens),
-            pool.address,
-          ])
-        );
-        await injectTokens(tokens);
-
-        decoratedPools = await poolDecorator.reCalculateTotalLiquidities();
-
-        return decoratedPools;
-      },
-    };
-  }
-
-  function buildRepositories() {
-    const repositories: any[] = [];
-    if (isBalancerApiDefined) {
-      const balancerApiRepository = initializeDecoratedAPIRepository();
-      repositories.push(balancerApiRepository);
+  function convertSortFieldToOrderBy(
+    sortField: string | undefined
+  ): GqlPoolOrderBy {
+    switch (sortField) {
+      case 'apr':
+        return GqlPoolOrderBy.Apr;
+      case 'volume':
+        return GqlPoolOrderBy.Volume24h;
+      case 'totalLiquidity':
+      default:
+        return GqlPoolOrderBy.TotalLiquidity;
     }
-    const subgraphRepository = initializeDecoratedSubgraphRepository();
-    repositories.push(subgraphRepository);
-
-    return repositories;
   }
 
-  function getQueryArgs(options: PoolsRepositoryFetchOptions): GraphQLArgs {
+  function getQueryArgs(options: PoolsRepositoryFetchOptions): ApiArgs {
     const { tokens, poolIds, poolTypes, sortField } = filterOptions.value;
     const hasPoolIdFilters = !!poolIds?.length && poolIds?.length > 0;
     const hasPoolTypeFilters = !!poolTypes?.length;
 
-    const tokensListFilterOperation = filterOptions.value.useExactTokens
-      ? 'eq'
-      : 'contains';
-
     const tokenListFormatted =
       tokens?.map(address => address.toLowerCase()) || [];
 
-    const orderBy = isBalancerApiDefined
-      ? sortField || 'totalLiquidity'
-      : 'totalLiquidity';
+    const orderBy = convertSortFieldToOrderBy(sortField);
 
-    const queryArgs: GraphQLArgs = {
-      chainId: configService.network.chainId,
+    const queryArgs: ApiArgs = {
       orderBy,
-      orderDirection: 'desc',
+      orderDirection: GqlPoolOrderDirection.Desc,
       where: {
-        tokensList: { [tokensListFilterOperation]: tokenListFormatted },
-        poolType: { in: POOLS.IncludedPoolTypes },
-        totalShares: { gt: 0.00001 },
-        id: { not_in: POOLS.BlockList },
+        chainIn: [mapNetworkToApiChain(configService.network.chainId)],
+        tokensIn: tokenListFormatted,
+        poolTypeIn: POOLS.IncludedPoolTypes.map(mapPoolTypeToApiType),
+        idNotIn: POOLS.BlockList,
       },
     };
 
     if (queryArgs.where && hasPoolTypeFilters && !!poolTypes?.length) {
-      queryArgs.where.poolType = {
-        in: poolTypes,
-      };
+      queryArgs.where.poolTypeIn = poolTypes.map(mapPoolTypeToApiType);
     }
 
     if (queryArgs.where && hasPoolIdFilters) {
-      queryArgs.where.id = { in: filterOptions.value.poolIds };
+      queryArgs.where.idIn = filterOptions.value.poolIds;
     }
     if (options.first) {
       queryArgs.first = filterOptions.value.first || options.first;
@@ -144,8 +106,6 @@ export default function usePoolsQuery(filterOptions: PoolFilterOptions) {
     if (options.skip) {
       queryArgs.skip = options.skip;
     }
-
-    // console.log('queryArgs', queryArgs);
 
     return queryArgs;
   }
